@@ -1,8 +1,6 @@
 extern crate rand;
-extern crate rayon;
 extern crate fnv;
 
-use rayon::prelude::*;
 use std::collections::HashMap;
 // use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -72,8 +70,8 @@ enum Val {
     D(f64),
     II(Vec<i64>),
     DD(Vec<f64>),
-    S(String),
-    SS(Vec<String>),
+    S(Rc<String>),
+    SS(Vec<Rc<String>>),
     TBL(Dict<RVal>),
     ERR(String),
 }
@@ -504,7 +502,7 @@ fn parser(l: &dyn Fn(&str) -> Vec<Token>) -> PCtx {
      ("elst", "expr (',' expr)* {conc}")].iter().for_each(|(n,v)| {map.insert(n.to_string(),parse(v));});
 
      // token parsers
-    map.insert("STR".to_string(),Box::new(|_,toks,i| Some((Val::S(toks[i].str[1..toks[i].str.len()-1].to_string()).into(),i+1))));
+    map.insert("STR".to_string(),Box::new(|_,toks,i| Some((Val::S(toks[i].str[1..toks[i].str.len()-1].to_string().into()).into(),i+1))));
     map.insert("NUM".to_string(),Box::new(|_,toks,i| {
         let s = toks[i].str;
         if s.contains('.') {
@@ -741,9 +739,9 @@ macro_rules! fn_cop2 {
                 (Val::II(i1),Val::DD(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(&(*v1 as f64),v2)as i64).collect()).into()),
                 (Val::DD(i1),Val::II(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,&(*v2 as f64))as i64).collect()).into()),
                 (Val::S(i1),Val::S(i2)) => Ok(Val::I($op(i1,i2)as i64).into()),
-                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.iter().map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.iter().map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
                 _ => Result::Err("type".into())
             }
         }
@@ -767,13 +765,13 @@ fn fn_rand(s:RVal, num:RVal) -> RRVal {
             let s: Vec<i64> = rng.sample_iter(rand::distributions::Uniform::from(l1..l2)).take(*n as usize).collect();
             Ok(Val::II(s).into())
         };
-        if ty == "s" {
+        if ty.as_ref() == "s" {
             let v = ["apple","msft","ibm","bp","gazp","google","fb","abc"];
-            let s: Vec<String> = rng.sample_iter(rand::distributions::Uniform::from(0..v.len())).map(|i| v[i].to_string()).take(*n as usize).collect();
+            let s: Vec<Rc<String>> = rng.sample_iter(rand::distributions::Uniform::from(0..v.len())).map(|i| v[i].to_string().into()).take(*n as usize).collect();
             return Ok(Val::SS(s).into());
-        } else if ty == "i" { return ri(0,100)
-        } else if ty == "i3" { return ri(0,3)
-        } else if ty == "i4" { return ri(1,4)
+        } else if ty.as_ref() == "i" { return ri(0,100)
+        } else if ty.as_ref() == "i3" { return ri(0,3)
+        } else if ty.as_ref() == "i4" { return ri(1,4)
         } else {
             let s: Vec<f64> = rng.sample_iter(rand::distributions::Open01).map(|f:f64| 100.0*f).take(*n as usize).collect();
             return Ok(Val::DD(s).into());
@@ -871,7 +869,7 @@ fn main() -> std::io::Result<()> {
     ectx.eval(p.parse(&l("set t [ a rand('i', 100), b rand('f',100)]"))).unwrap();
     ectx.eval(p.parse(&l("set t2 [ a rand('i', 100), c rand('f',100)]"))).unwrap();
 
-    ectx.eval(p.parse(&l("set bt [sym rand('s',10000000), size rand('i', 10000000), price rand('f', 10000000)]"))).unwrap();
+    ectx.eval(p.parse(&l("set bt [sym rand('s',100000000), size rand('i', 100000000), price rand('f', 100000000)]"))).unwrap();
     ectx.eval(p.parse(&l("set ref [sym rand('s', 100), size rand('i', 100), info rand('f',100)]"))).unwrap();
     ectx.eval(p.parse(&l("select sym,size,max(info) as info into res from ref where size<50 group by sym,size"))).unwrap();
     // select sym,size,count(*),avg(price) into r from bt group by sym,size
@@ -896,5 +894,5 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 // HashMap BTreeMap FnvHashMap
-// 10m  3.35 4.39 3.08
-// 100m 44   53.4 40
+// 10m  3.35 4.39 3.08->1.9
+// 100m 44   53.4 40 -> 30
