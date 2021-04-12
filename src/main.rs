@@ -1,9 +1,12 @@
 extern crate rand;
 extern crate rayon;
+extern crate fnv;
 
 use rayon::prelude::*;
 use std::collections::HashMap;
+// use std::collections::BTreeMap;
 use std::rc::Rc;
+use fnv::FnvHashMap;
 
 #[derive(Debug)]
 struct Token<'a> {
@@ -282,10 +285,16 @@ impl ECtx {
 
     fn do_sel(&mut self, mut s:Sel) -> RRVal {
         let (tbl,idx) = (std::mem::take(&mut self.tbl),std::mem::take(&mut self.idx));
-        let into = std::mem::take(&mut s.into);
+        let into = std::mem::take(&mut s.into); let d = s.d;
         let r = self.do_sel_core(s);
         self.tbl = tbl; self.idx = idx;
-        let r = r?;
+        let mut r = r?;
+        if d { // if let will always succeed
+            if let Some(Val::TBL(ref mut d)) = Rc::get_mut(&mut r) {
+                let v = std::mem::take(&mut d.v);
+                d.v = Self::do_dist(v)?
+            }
+        }
         if let Some(n) = into { self.ctx.insert(n,r.clone()); }
         Ok(r)
     }
@@ -305,12 +314,12 @@ impl ECtx {
         if let Some(g) = s.g {
             let r = self.eval_table_inner(g)?;
             let l = r[0].len() as usize;
-            let mut h:HashMap<HashedKey,Vec<usize>> = HashMap::with_capacity(l/3);
+            let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
             for i in 0..l as usize {
                 let e = h.entry(HashedKey{src:&r,idx:i}).or_insert(Vec::new());
                 e.push(i);
             }
-            let idx: Vec<Vec<usize>> = h.drain().map(|(_,v)| if let Some(ref i) = self.idx {v.into_iter().map(|v| i[v]).collect()} else {v}).collect();
+            let idx: Vec<Vec<usize>> = h.into_iter().map(|(_,v)| if let Some(ref i) = self.idx {v.into_iter().map(|v| i[v]).collect()} else {v}).collect();
             let r = idx.into_iter().map(|i| {self.idx = Some(i); se.v.clone().into_iter().map(|v| self.eval(v)).collect::<Result<Vec<RVal>,String>>()}).collect::<Result<Vec<Vec<RVal>>,String>>()?;
             let res = r[0].iter().map(|v| v.get_vec(r[0].len())).collect::<Result<Vec<RVal>,String>>()?;
             let res = r.into_iter().try_fold(res,|res,v| res.into_iter().zip(v.into_iter())
@@ -318,6 +327,15 @@ impl ECtx {
             return Ok(Val::TBL(Dict::from_parts(se.k,res)).into());
         }
         self.eval_table(se.k, se.v)
+    }
+
+    fn do_dist(v: Vec<RVal>) -> Result<Vec<RVal>,String> {
+        let l = v[0].len() as usize;
+        let mut h:FnvHashMap<HashedKey,usize> = FnvHashMap::default();
+        for i in 0..l as usize { h.entry(HashedKey{src:&v,idx:i}).or_insert(i); }
+        if h.len() == v.len() {return Ok(v)}
+        let idx = h.into_iter().map(|(_,v)| v).collect();
+        v.into_iter().map(|v| v.filter(&idx)).collect::<Result<Vec<RVal>,String>>()
     }
 
     fn do_where(&mut self, w:Option<Box<Expr>>) -> Result<(),String> {
@@ -353,13 +371,10 @@ impl ECtx {
     }
 
     // find join idxs into t1 and t2
-    fn do_sij(mut t1:Vec<RVal>, mut t2:Vec<RVal>) -> Result<(Vec<usize>,Vec<usize>),String> {
+    fn do_sij(t1:Vec<RVal>, t2:Vec<RVal>) -> Result<(Vec<usize>,Vec<usize>),String> {
         let ylen = t2[0].len() as usize;
-        let i = if t1.len() == 1 { // t1.a = t2.b - only one cond
-            let x = t1.pop().unwrap(); let y = t2.pop().unwrap();
-            fn_find(y,x)? // it is ok to consume Rc - we don't need them anymore
-        } else {
-            let h:HashMap<HashedKey,usize> = (0..t2[0].len()as usize).into_iter().map(|i| (HashedKey{src:&t2,idx:i},i)).collect();
+        let i:Vec<usize> =  { 
+            let h:FnvHashMap<HashedKey,usize> = (0..t2[0].len()as usize).into_iter().map(|i| (HashedKey{src:&t2,idx:i},i)).collect();
             (0..t1[0].len()as usize).into_iter().map(|i| if let Some(j) = h.get(&HashedKey{src:&t1,idx:i}) {*j} else {ylen}).collect()
         };
         let j: Vec<usize> = i.iter().enumerate().filter_map(|(i,v)| if *v<ylen {Some(i)} else {None}).collect();
@@ -412,6 +427,33 @@ impl PartialEq for HashedKey<'_> {
 }
 
 impl Eq for HashedKey<'_> {}
+
+impl Ord for HashedKey<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let mut o = std::cmp::Ordering::Equal;
+        for i in 0..self.src.len() {
+            o = match (&*self.src[i],&*other.src[i]) {
+                (Val::II(v1),Val::II(v2)) => v1[self.idx].cmp(&v2[other.idx]),
+                (Val::DD(v1),Val::DD(v2)) => if let Some(o) = v1[self.idx].partial_cmp(&v2[other.idx]) {o} else
+                    {match (v1[self.idx].is_nan(),v2[other.idx].is_nan()) {
+                        (true,true) => std::cmp::Ordering::Equal,
+                        (true,false) => std::cmp::Ordering::Less,
+                        _ => std::cmp::Ordering::Greater
+                    }}
+                (Val::SS(v1),Val::SS(v2)) => v1[self.idx].cmp(&v2[other.idx]),
+                _ => panic!("unexpected type in HashKey::Ord")
+            };
+            if o != std::cmp::Ordering::Equal {break}
+        }
+        return o
+    }
+}
+
+impl PartialOrd for HashedKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl From<Val> for Expr {
     fn from(v:Val) -> Self {Expr::Val(v)}
@@ -820,14 +862,6 @@ fn fn_idxn(a:RVal, idx: &Vec<usize>) -> RRVal {
         _ => Result::Err("type".into())
     }
 }
-fn fn_find(a:RVal, b:RVal) -> Result<Vec<usize>,String> {
-    match (&*a,&*b) {
-        (Val::II(v1),Val::II(v2)) => Ok(findn(v1,v2)),
-        (Val::DD(v1),Val::DD(v2)) => Ok(findn(v1,v2)),
-        (Val::SS(v1),Val::SS(v2)) => Ok(findn(v1,v2)),
-        _ => Err("type".into())
-    }
-}
 
 fn main() -> std::io::Result<()> {
     let l = lexer();
@@ -861,3 +895,6 @@ fn main() -> std::io::Result<()> {
     }
     Ok(())
 }
+// HashMap BTreeMap FnvHashMap
+// 10m  3.35 4.39 3.08
+// 100m 44   53.4 40
