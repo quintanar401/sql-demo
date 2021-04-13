@@ -117,6 +117,14 @@ impl Val {
         (Val::SS(v),Val::SS(i)) => Ok(v.push(i[0].clone())),
         _ => Err("type".into())
     }}
+    fn idx(&self, idx: usize) -> RRVal { 
+        match &*self {
+            Val::II(v) => Ok(Val::I(v[idx]).into()),
+            Val::DD(v) => Ok(Val::D(v[idx]).into()),
+            Val::SS(v) => Ok(Val::S(v[idx].clone()).into()),
+            _ => Result::Err("type".into())
+        }
+    }
 }
 
 impl std::fmt::Display for Val {   
@@ -144,7 +152,7 @@ impl std::fmt::Display for Val {
                 let mut s: Vec<String> = (0..1+cnt).map(|_| String::new()).collect();
                 for (i,c) in d.k.iter().enumerate() {
                     s[0] = format!("{} {}",s[0],c);
-                    for j in 0..cnt { s[j+1] = format!("{} {}",s[j+1],fn_idx(d.v[i].clone(),j).unwrap()) }
+                    for j in 0..cnt { s[j+1] = format!("{} {}",s[j+1],d.v[i].idx(j).unwrap()) }
                     s = adj_col(s)
                 }
                 writeln!(f,"{}",s[0])?;
@@ -228,10 +236,11 @@ struct ECtx {
     ctx: HashMap<String,Rc<Val>>,   // variables
     tbl: Option<Table>,             // within select
     idx: Option<Vec<usize>>,        // idx into tbl
+    grp: Vec<String>,               // group by cols
 }
 
 impl ECtx {
-    fn new() -> Self {ECtx {ctx:HashMap::new(), tbl:None, idx: None}}
+    fn new() -> Self {ECtx {ctx:HashMap::new(), tbl:None, idx: None, grp:vec![]}}
 
     fn eval_table(&mut self, n: Vec<String>, e: Vec<Expr>) -> RRVal {
         if distinct(&n).len() != n.len() { return Result::Err("duplicate name".into())}
@@ -269,7 +278,9 @@ impl ECtx {
         if let Some(ref tbl) = self.tbl {
             if let Some(n2) = tbl.cmap.get(&n) {
                 let mut v = tbl.tbl.get_unchecked(&n2).clone();
-                if let Some(ref idx) = self.idx { v = v.filter(idx)? }
+                let is_grp = self.grp.contains(&n);
+                if let Some(ref idx) = self.idx { v = if is_grp {v.idx(idx[0])?} else {v.filter(idx)?} }
+                else {v = if is_grp {v.idx(0)?} else {v}}
                 return Ok(v)
             } else if n == "_i" {
                 // we must return idx really but we would need to clone it, it is used only in count(*) atm so it is ok
@@ -282,10 +293,10 @@ impl ECtx {
     }
 
     fn do_sel(&mut self, mut s:Sel) -> RRVal {
-        let (tbl,idx) = (std::mem::take(&mut self.tbl),std::mem::take(&mut self.idx));
+        let (tbl,idx,grp) = (std::mem::take(&mut self.tbl),std::mem::take(&mut self.idx),std::mem::take(&mut self.grp));
         let into = std::mem::take(&mut s.into); let d = s.d;
         let r = self.do_sel_core(s);
-        self.tbl = tbl; self.idx = idx;
+        self.tbl = tbl; self.idx = idx; self.grp = grp;
         let mut r = r?;
         if d { // if let will always succeed
             if let Some(Val::TBL(ref mut d)) = Rc::get_mut(&mut r) {
@@ -310,6 +321,7 @@ impl ECtx {
                 Dict::from(k)
             };
         if let Some(g) = s.g {
+            let grp: Vec<String> = g.iter().filter_map(|v| if let Expr::ID(n) = v {Some(n.clone())} else {None}).collect();
             let r = self.eval_table_inner(g)?;
             let l = r[0].len() as usize;
             let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
@@ -318,6 +330,7 @@ impl ECtx {
                 e.push(i);
             }
             let idx: Vec<Vec<usize>> = h.into_iter().map(|(_,v)| if let Some(ref i) = self.idx {v.into_iter().map(|v| i[v]).collect()} else {v}).collect();
+            self.grp = grp;
             let r = idx.into_iter().map(|i| {self.idx = Some(i); se.v.clone().into_iter().map(|v| self.eval(v)).collect::<Result<Vec<RVal>,String>>()}).collect::<Result<Vec<Vec<RVal>>,String>>()?;
             let res = r[0].iter().map(|v| v.get_vec(r[0].len())).collect::<Result<Vec<RVal>,String>>()?;
             let res = r.into_iter().try_fold(res,|res,v| res.into_iter().zip(v.into_iter())
@@ -361,8 +374,8 @@ impl ECtx {
             let j1: Vec<RVal> = c0.iter().map(|c| tbl1.get_unchecked(c).clone()).collect(); // cond -> values
             let j2: Vec<RVal> = c1.iter().map(|c| tbl2.tbl.get_unchecked(c).clone()).collect();
             let (i1,i2) = ECtx::do_sij(j1,j2)?;
-            tbl.tbl = tbl1.into_iter().map(|(k,v)| Ok((k,fn_idxn(v,&i1)?))).collect::<Result<Vec<(String,RVal)>,String>>()?.into_iter().unzip().into();
-            for v in tbl2.tbl { if c1.len() == find1(&c1,&v.0) {tbl.tbl.set(v.0,fn_idxn(v.1,&i2)?);} }
+            tbl.tbl = tbl1.into_iter().map(|(k,v)| Ok((k,v.filter(&i1)?))).collect::<Result<Vec<(String,RVal)>,String>>()?.into_iter().unzip().into();
+            for v in tbl2.tbl { if c1.len() == find1(&c1,&v.0) {tbl.tbl.set(v.0,v.1.filter(&i2)?);} }
             tbl.cmap = tbl2.cmap;
         }
         Ok(tbl)
@@ -844,22 +857,6 @@ fn fn_neg(a:RVal) -> RRVal {
         _ => Result::Err("type".into())
     }
 }
-fn fn_idx(a:RVal, idx: usize) -> RRVal { 
-    match &*a {
-        Val::II(v) => Ok(Val::I(v[idx]).into()),
-        Val::DD(v) => Ok(Val::D(v[idx]).into()),
-        Val::SS(v) => Ok(Val::S(v[idx].clone()).into()),
-        _ => Result::Err("type".into())
-    }
-}
-fn fn_idxn(a:RVal, idx: &Vec<usize>) -> RRVal { 
-    match &*a {
-        Val::II(v) => Ok(Val::II(idx.iter().map(|i| v[*i]).collect()).into()),
-        Val::DD(v) => Ok(Val::DD(idx.iter().map(|i| v[*i]).collect()).into()),
-        Val::SS(v) => Ok(Val::SS(idx.iter().map(|i| v[*i].clone()).collect()).into()),
-        _ => Result::Err("type".into())
-    }
-}
 
 fn main() -> std::io::Result<()> {
     let l = lexer();
@@ -894,5 +891,5 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 // HashMap BTreeMap FnvHashMap
-// 10m  3.35 4.39 3.08->1.9
-// 100m 44   53.4 40 -> 30
+// 10m  3.35 4.39 3.08 -> 1.9 -> 1.45
+// 100m 44   53.4 40 -> 30 -> 17.2
