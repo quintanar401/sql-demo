@@ -1,10 +1,12 @@
 extern crate rand;
 extern crate fnv;
+extern crate rayon;
 
 use std::collections::HashMap;
 // use std::collections::BTreeMap;
 use std::rc::Rc;
 use fnv::FnvHashMap;
+use rayon::prelude::*;
 
 #[derive(Debug)]
 struct Token<'a> {
@@ -36,7 +38,9 @@ fn lexer() -> impl Fn(&str) -> Vec<Token> {
         for r in rules {
             let st:Vec<Vec<usize>> = r.iter().map(|v| findn(states.as_ref(),v)).collect(); // st:states?y
             let i2 = if r[2].len() > find1(r[2],&b'*') {til(len)} else {st[2].clone()}; // i2:(st 2;til 1+count cgrp)"*" in y 2
-            for &i in &st[0] { sidxn1(&mut fsa[i],&i2,&st[1][0]) } // x[st 0;i2] = st[1;0]
+            for &i in &st[0] {
+                for &j in &i2 {
+                    fsa[i][j] = st[1][0]}} // x[st 0;i2] = st[1;0]
         }
         fsa
     };
@@ -48,9 +52,10 @@ fn lexer() -> impl Fn(&str) -> Vec<Token> {
         if s.len()==0 {return Vec::<Token>::new()};
         let mut sti = 0usize;
         let st: Vec<usize> = s.as_bytes().iter().map(|b| { // st:fsa\[0;c2grp x]
-            sti = fsa[sti][c2grp[*b as usize]];
+            sti = fsa[sti][c2grp[std::cmp::min(*b as usize,127)]];
             sti}).collect();
-        let mut ix = wh(&lt1(&st, sta)); // where st<sta
+        let mut ix: Vec<usize> = st.iter().enumerate()
+            .filter_map(|(i,v)| if *v<sta {Some(i)} else {None}).collect();
         ix.push(st.len());
         (0..ix.len()-1).into_iter()
             .filter_map(|i|
@@ -83,10 +88,9 @@ impl Val {
         Val::II(i) => i.len() as i64,
         Val::DD(i) => i.len() as i64,
         Val::SS(i) => i.len() as i64,
-        Val::I(_) => -1,
-        Val::D(_) => -1,
-        Val::S(_) => -1,
-        _ => -2}}
+        Val::I(_) | Val::D(_) | Val::S(_) => -1,
+        _ => -2}
+    }
     fn take(&self, i: usize) -> RVal { match self {
         Val::I(j) => Val::II(vec![*j;i]).into(),
         Val::D(j) => Val::DD(vec![*j;i]).into(),
@@ -100,14 +104,11 @@ impl Val {
         _ => Err("type".into())}
     }
     fn get_vec(&self, l: usize) -> RRVal { match self {
-        Val::I(_) => Ok(Val::II(Vec::with_capacity(l)).into()),
-        Val::D(_) => Ok(Val::DD(Vec::with_capacity(l)).into()),
-        Val::S(_) => Ok(Val::SS(Vec::with_capacity(l)).into()),
-        Val::II(_) => Ok(Val::II(Vec::with_capacity(l)).into()),
-        Val::DD(_) => Ok(Val::DD(Vec::with_capacity(l)).into()),
-        Val::SS(_) => Ok(Val::SS(Vec::with_capacity(l)).into()),
-        _ => Err("type".into())
-    }}
+        Val::I(_) | Val::II(_) => Ok(Val::II(Vec::with_capacity(l)).into()),
+        Val::D(_) | Val::DD(_) => Ok(Val::DD(Vec::with_capacity(l)).into()),
+        Val::S(_) | Val::SS(_) => Ok(Val::SS(Vec::with_capacity(l)).into()),
+        _ => Err("type".into())}
+    }
     fn join(&mut self, v:RVal) -> Result<(),String> { match (self,&*v) {
         (Val::II(v),Val::I(i)) => Ok(v.push(*i)),
         (Val::II(v),Val::II(i)) => Ok(v.push(i[0])),
@@ -115,15 +116,13 @@ impl Val {
         (Val::DD(v),Val::DD(i)) => Ok(v.push(i[0])),
         (Val::SS(v),Val::S(i)) => Ok(v.push(i.clone())),
         (Val::SS(v),Val::SS(i)) => Ok(v.push(i[0].clone())),
-        _ => Err("type".into())
-    }}
-    fn idx(&self, idx: usize) -> RRVal { 
-        match &*self {
-            Val::II(v) => Ok(Val::I(v[idx]).into()),
-            Val::DD(v) => Ok(Val::D(v[idx]).into()),
-            Val::SS(v) => Ok(Val::S(v[idx].clone()).into()),
-            _ => Result::Err("type".into())
-        }
+        _ => Err("type".into())}
+    }
+    fn idx(&self, idx: usize) -> RRVal { match &*self {
+        Val::II(v) => Ok(Val::I(v[idx]).into()),
+        Val::DD(v) => Ok(Val::D(v[idx]).into()),
+        Val::SS(v) => Ok(Val::S(v[idx].clone()).into()),
+        _ => Result::Err("type".into())}
     }
 }
 
@@ -180,12 +179,12 @@ enum Expr {
 
 #[derive(Debug,Clone)]
 struct Sel {
-    s:Option<(Vec<String>,Vec<Expr>)>,
-    d:bool,
+    s: Option<(Vec<String>,Vec<Expr>)>,
+    d: bool,
     into: Option<String>,
     w: Option<Box<Expr>>,
     g: Option<Vec<Expr>>,
-    j:(Box<(String,Expr)>,(Vec<(String,Expr)>,Vec<(Vec<String>,Vec<String>)>)), // (Str,Expr) -> name: table; (Str*,Str*) -> join conditions
+    j: (Box<(String,Expr)>,(Vec<(String,Expr)>,Vec<(Vec<String>,Vec<String>)>)), // (Str,Expr) -> name: table; (Str*,Str*) -> join conditions
 }
 
 impl Expr {
@@ -210,7 +209,7 @@ impl<T> Dict<T> {
     }
     fn get_unchecked(&self, k:&String) -> &T { &self.v[find1(&self.k, k)] }
     fn get(&self, k:&String) -> Option<&T> { let i = find1(&self.k, k); if i<self.k.len() {Some(&self.v[i])} else {None} }
-    fn extend(&mut self, d:Dict<T>) { d.k.into_iter().zip(d.v.into_iter()).for_each(|(k,v)| self.set(k,v)) }
+    fn extend(&mut self, d:Dict<T>) { d.into_iter().for_each(|(k,v)| self.set(k,v)) }
 }
 
 impl<T> From<(Vec<String>,Vec<T>)> for Dict<T> {
@@ -227,8 +226,8 @@ impl<T> IntoIterator for Dict<T> {
 }
 
 struct Table {
-    cmap: Dict<String>,
-    tbl: Dict<RVal>,
+    cmap: Dict<String>, // names -> unique names
+    tbl: Dict<RVal>,    // unames -> vals
 }
 
 
@@ -243,7 +242,7 @@ impl ECtx {
     fn new() -> Self {ECtx {ctx:HashMap::new(), tbl:None, idx: None, grp:vec![]}}
 
     fn eval_table(&mut self, n: Vec<String>, e: Vec<Expr>) -> RRVal {
-        if distinct(&n).len() != n.len() { return Result::Err("duplicate name".into())}
+        if distinct(&n).len() != n.len() { return Err("duplicate name".into())}
         let v = self.eval_table_inner(e)?;
         Ok(Val::TBL(Dict::from_parts(n,v)).into())
     }
@@ -253,8 +252,8 @@ impl ECtx {
         let mut sz = -1;
         for i in r.iter() { // all columns must be vecs of the same size, convert atoms by dup
             let rsz = i.len();
-            if rsz > -1 && sz > -1 && sz != rsz {return Result::Err("length".into())}; // length control
-            if rsz == -2 {return Result::Err("type".into())}; // only atoms and vecs
+            if rsz > -1 && sz > -1 && sz != rsz {return Err("length".into())}; // length control
+            if rsz == -2 {return Err("type".into())}; // only atoms and vecs
             if rsz > -1 {sz = rsz}
         }
         if sz == -1 {sz = 1}
@@ -270,7 +269,7 @@ impl ECtx {
             Expr::F2(f,e1,e2) => Ok(f(self.eval(*e1)?,self.eval(*e2)?)?),
             Expr::Tbl(n,e) => { self.eval_table(n, e) }
             Expr::Sel(s) => self.do_sel(s),
-            e => Result::Err(format!("unexpected expr {:?}",e))
+            e => Err(format!("unexpected expr {:?}",e))
         }
     }
     // search tbl, then vars
@@ -324,11 +323,34 @@ impl ECtx {
             let grp: Vec<String> = g.iter().filter_map(|v| if let Expr::ID(n) = v {Some(n.clone())} else {None}).collect();
             let r = self.eval_table_inner(g)?;
             let l = r[0].len() as usize;
-            let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
-            for i in 0..l as usize {
-                let e = h.entry(HashedKey{src:&r,idx:i}).or_insert(Vec::new());
-                e.push(i);
-            }
+            let key = HashedKey::new(&r);
+            let h = if l>99000 {
+                let cpu = rayon::current_num_threads();
+                let delta = 1+l/cpu;
+                let h:Vec<FnvHashMap<HashedKey,Vec<usize>>> = (0..cpu).into_par_iter().map(|i| {
+                    let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
+                    for i in i*delta..std::cmp::min(l,(i+1)*delta) {
+                        let e = h.entry(key.clone_with_idx(i)).or_insert(Vec::new());
+                        e.push(i);
+                    }
+                    h
+                }).collect();
+                h.into_iter().fold(FnvHashMap::default(),|mut total,v|{
+                    if total.len()==0 {return v};
+                    for (k,val) in v {
+                        let h = total.entry(k).or_insert(Vec::new());
+                        h.extend(val);
+                    }
+                    total
+                })
+            } else {
+                let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
+                for i in 0..l as usize {
+                 let e = h.entry(key.clone_with_idx(i)).or_insert(Vec::new());
+                    e.push(i);
+                };
+                h
+            };
             let idx: Vec<Vec<usize>> = h.into_iter().map(|(_,v)| if let Some(ref i) = self.idx {v.into_iter().map(|v| i[v]).collect()} else {v}).collect();
             self.grp = grp;
             let r = idx.into_iter().map(|i| {self.idx = Some(i); se.v.clone().into_iter().map(|v| self.eval(v)).collect::<Result<Vec<RVal>,String>>()}).collect::<Result<Vec<Vec<RVal>>,String>>()?;
@@ -343,7 +365,8 @@ impl ECtx {
     fn do_dist(v: Vec<RVal>) -> Result<Vec<RVal>,String> {
         let l = v[0].len() as usize;
         let mut h:FnvHashMap<HashedKey,usize> = FnvHashMap::default();
-        for i in 0..l as usize { h.entry(HashedKey{src:&v,idx:i}).or_insert(i); }
+        let key = HashedKey::new(&v);
+        for i in 0..l as usize { h.entry(key.clone_with_idx(i)).or_insert(i); }
         if h.len() == v.len() {return Ok(v)}
         let idx = h.into_iter().map(|(_,v)| v).collect();
         v.into_iter().map(|v| v.filter(&idx)).collect::<Result<Vec<RVal>,String>>()
@@ -384,9 +407,10 @@ impl ECtx {
     // find join idxs into t1 and t2
     fn do_sij(t1:Vec<RVal>, t2:Vec<RVal>) -> Result<(Vec<usize>,Vec<usize>),String> {
         let ylen = t2[0].len() as usize;
-        let i:Vec<usize> =  { 
-            let h:FnvHashMap<HashedKey,usize> = (0..t2[0].len()as usize).into_iter().map(|i| (HashedKey{src:&t2,idx:i},i)).collect();
-            (0..t1[0].len()as usize).into_iter().map(|i| if let Some(j) = h.get(&HashedKey{src:&t1,idx:i}) {*j} else {ylen}).collect()
+        let i:Vec<usize> =  {
+            let key1 = HashedKey::new(&t1); let key2 = HashedKey::new(&t2);
+            let h:FnvHashMap<HashedKey,usize> = (0..t2[0].len()as usize).into_iter().map(|i| (key2.clone_with_idx(i),i)).collect();
+            (0..t1[0].len()as usize).into_iter().map(|i| if let Some(j) = h.get(&key1.clone_with_idx(i)) {*j} else {ylen}).collect()
         };
         let j: Vec<usize> = i.iter().enumerate().filter_map(|(i,v)| if *v<ylen {Some(i)} else {None}).collect();
         let i = j.iter().map(|v| i[*v]).collect();
@@ -410,14 +434,25 @@ impl ECtx {
     }
 }
 
+#[derive(Clone)]
 struct HashedKey<'a> {
-    src:&'a Vec<RVal>,
+    src: usize,
     idx: usize,
+    _ph: std::marker::PhantomData<&'a usize>, // 'a ensures HK will not outlive HashMap
+}
+
+impl<'a> HashedKey<'a> {
+    // 'a bounds v and the key
+    fn new(v: &'a Vec<RVal>) -> Self { Self { src: v as * const Vec<RVal> as usize, idx:0, _ph:std::marker::PhantomData}  }
+    fn clone_with_idx(&self, i: usize) -> Self { Self {src:self.src, idx:i, _ph:std::marker::PhantomData} }
+    // unsafe because the caller MUST ensure that Rcs are never cloned
+    unsafe fn get_ref(&self) -> &'a Vec<RVal> { &*(self.src as * const Vec<RVal>)}
 }
 
 impl std::hash::Hash for HashedKey<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.src.iter().for_each(|v| match &**v {
+        let src = unsafe { self.get_ref()}; // no Rc clone!
+        src.iter().for_each(|v| match &**v {
             Val::II(v) => v[self.idx].hash(state),
             Val::DD(v) => v[self.idx].to_be_bytes().hash(state),
             Val::SS(v) => v[self.idx].hash(state),
@@ -428,7 +463,9 @@ impl std::hash::Hash for HashedKey<'_> {
 
 impl PartialEq for HashedKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.src.iter().zip(other.src.iter()).all(|(v1,v2)| match (&**v1,&**v2) {
+        let src = unsafe { self.get_ref()}; // no Rc clone!
+        let sother = unsafe { other.get_ref()}; // no Rc clone!
+        src.iter().zip(sother.iter()).all(|(v1,v2)| match (&**v1,&**v2) {
             (Val::II(v1),Val::II(v2)) => v1[self.idx] == v2[other.idx],
             (Val::DD(v1),Val::DD(v2)) => v1[self.idx] == v2[other.idx],
             (Val::SS(v1),Val::SS(v2)) => v1[self.idx] == v2[other.idx],
@@ -442,8 +479,10 @@ impl Eq for HashedKey<'_> {}
 impl Ord for HashedKey<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let mut o = std::cmp::Ordering::Equal;
-        for i in 0..self.src.len() {
-            o = match (&*self.src[i],&*other.src[i]) {
+        let src = unsafe { self.get_ref()}; // no Rc clone!
+        let osrc = unsafe { other.get_ref()}; // no Rc clone!
+        for i in 0..src.len() {
+            o = match (&*src[i],&*osrc[i]) {
                 (Val::II(v1),Val::II(v2)) => v1[self.idx].cmp(&v2[other.idx]),
                 (Val::DD(v1),Val::DD(v2)) => if let Some(o) = v1[self.idx].partial_cmp(&v2[other.idx]) {o} else
                     {match (v1[self.idx].is_nan(),v2[other.idx].is_nan()) {
@@ -683,9 +722,6 @@ fn distinct<T: std::hash::Hash + Eq + Clone>(v:&[T]) -> Vec<T> {
 fn find1<T:PartialEq>(v:&[T], a:&T) -> usize { for (i,b) in v.iter().enumerate() {if b == a {return i}}; v.len() }
 fn findn<T:PartialEq>(v:&[T], a:&[T]) -> Vec<usize> { a.iter().map(|b| find1(v,b)).collect() }
 fn til(a:usize) -> Vec<usize> { (0..a).into_iter().collect() }
-fn sidxn1<T:Clone>(v:&mut[T], ix:&[usize], e:&T) { for &i in ix { v[i] = e.clone() }}
-fn lt1<T:Ord+Copy>(v:&[T],a:T) -> Vec<bool> { v.iter().map(|b| *b<a).collect() }
-fn wh(v:&[bool]) -> Vec<usize> {v.iter().enumerate().filter_map(|(i,&b)| if b {Some(i)} else {None}).collect()}
 
 macro_rules! fn_op2 {
     ($n:ident,$op:path) => {
@@ -795,18 +831,18 @@ fn fn_rand(s:RVal, num:RVal) -> RRVal {
 
 fn fn_sum(a:RVal) -> RRVal {
     match &*a {
-        Val::I(_) => Ok(a.clone()),
+        Val::I(_) => Ok(a),
         Val::II(v) => Ok(Val::I(v.into_iter().sum()).into()),
-        Val::D(_) => Ok(a.clone()),
+        Val::D(_) => Ok(a),
         Val::DD(v) => Ok(Val::D(v.into_iter().sum()).into()),
         _ => Result::Err("type".into())
     }
 }
 fn fn_avg(a:RVal) -> RRVal { 
     match &*a {
-        Val::I(_) => Ok(a.clone()),
+        Val::I(_) => Ok(a),
         Val::II(v) => Ok(Val::D(v.into_iter().sum::<i64>() as f64 / v.len() as f64).into()),
-        Val::D(_) => Ok(a.clone()),
+        Val::D(_) => Ok(a),
         Val::DD(v) => Ok(Val::D(v.into_iter().sum::<f64>() / v.len() as f64).into()),
         _ => Result::Err("type".into())
     }
@@ -825,18 +861,18 @@ fn fn_count(a:RVal) -> RRVal {
 }
 fn fn_min(a:RVal) -> RRVal {
     match &*a {
-        Val::I(_) => Ok(a.clone()),
+        Val::I(_) => Ok(a),
         Val::II(v) => Ok(Val::I(if let Some(m) = v.iter().min() {*m} else {i64::MAX}).into()),
-        Val::D(_) => Ok(a.clone()),
+        Val::D(_) => Ok(a),
         Val::DD(v) => Ok(Val::D(if 0<v.len() {v.iter().fold(f64::MAX,|m,i| m.min(*i))} else {f64::NAN}).into()),
         _ => Result::Err("type".into())
     }
 }
 fn fn_max(a:RVal) -> RRVal { 
     match &*a {
-        Val::I(_) => Ok(a.clone()),
+        Val::I(_) => Ok(a),
         Val::II(v) => Ok(Val::I(if let Some(m) = v.iter().max() {*m} else {i64::MIN}).into()),
-        Val::D(_) => Ok(a.clone()),
+        Val::D(_) => Ok(a),
         Val::DD(v) => Ok(Val::D(if 0<v.len() {v.iter().fold(f64::MIN,|m,i| m.max(*i))} else {f64::NAN}).into()),
         _ => Result::Err("type".into())
     }
@@ -891,5 +927,5 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 // HashMap BTreeMap FnvHashMap
-// 10m  3.35 4.39 3.08 -> 1.9 -> 1.45
-// 100m 44   53.4 40 -> 30 -> 17.2
+// 10m  3.35 4.39 3.08 -> 1.9 -> 1.45 -> 1
+// 100m 44   53.4 40 -> 30 -> 17.2 -> 12
