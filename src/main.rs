@@ -327,15 +327,13 @@ impl ECtx {
             let h = if l>99000 {
                 let cpu = rayon::current_num_threads();
                 let delta = 1+l/cpu;
-                let h:Vec<FnvHashMap<HashedKey,Vec<usize>>> = (0..cpu).into_par_iter().map(|i| {
+                (0..cpu).into_par_iter().map(|i| {
                     let mut h:FnvHashMap<HashedKey,Vec<usize>> = FnvHashMap::default();
                     for i in i*delta..std::cmp::min(l,(i+1)*delta) {
                         let e = h.entry(key.clone_with_idx(i)).or_insert(Vec::new());
                         e.push(i);
                     }
-                    h
-                }).collect();
-                h.into_iter().fold(FnvHashMap::default(),|mut total,v|{
+                    h}).reduce(|| FnvHashMap::default(), |mut total,v|{
                     if total.len()==0 {return v};
                     for (k,val) in v {
                         let h = total.entry(k).or_insert(Vec::new());
@@ -873,7 +871,8 @@ fn fn_max(a:RVal) -> RRVal {
         Val::I(_) => Ok(a),
         Val::II(v) => Ok(Val::I(if let Some(m) = v.iter().max() {*m} else {i64::MIN}).into()),
         Val::D(_) => Ok(a),
-        Val::DD(v) => Ok(Val::D(if 0<v.len() {v.iter().fold(f64::MIN,|m,i| m.max(*i))} else {f64::NAN}).into()),
+        // Val::DD(v) => Ok(Val::D(if 0<v.len() {v.iter().fold(f64::MIN,|m,i| m.max(*i))} else {f64::NAN}).into()),
+        Val::DD(v) => Ok(Val::D(if 0<v.len() {v.par_iter().copied().reduce(|| f64::MIN,|m,i| m.max(i))} else {f64::NAN}).into()),
         _ => Result::Err("type".into())
     }
 }
@@ -903,6 +902,7 @@ fn main() -> std::io::Result<()> {
     ectx.eval(p.parse(&l("set t2 [ a rand('i', 100), c rand('f',100)]"))).unwrap();
 
     ectx.eval(p.parse(&l("set bt [sym rand('s',100000000), size rand('i', 100000000), price rand('f', 100000000)]"))).unwrap();
+    ectx.eval(p.parse(&l("set bt2 [sym rand('s',10000000), size rand('i', 10000000), price rand('f', 10000000)]"))).unwrap();
     ectx.eval(p.parse(&l("set ref [sym rand('s', 100), size rand('i', 100), info rand('f',100)]"))).unwrap();
     ectx.eval(p.parse(&l("select sym,size,max(info) as info into res from ref where size<50 group by sym,size"))).unwrap();
     // select sym,size,count(*),avg(price) into r from bt group by sym,size
