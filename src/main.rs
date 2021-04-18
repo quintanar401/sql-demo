@@ -4,7 +4,7 @@ extern crate rayon;
 
 use std::collections::HashMap;
 // use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use fnv::FnvHashMap;
 use rayon::prelude::*;
 
@@ -46,7 +46,7 @@ fn lexer() -> impl Fn(&str) -> Vec<Token> {
     };
     let sta = find1(&states,&b'A');
     let stn = findn(&states,b"a0\"'\t");
-    let s2n = move |v| ["ID","NUM","STR","STR","WS","OTHER"][find1(&stn,&v)].clone();
+    let s2n = move |v| ["ID","NUM","STR","STR","WS","OTHER"][find1(&stn,&v)];
     // Lexer itself
     move |s| {
         if s.len()==0 {return Vec::<Token>::new()};
@@ -66,8 +66,8 @@ fn lexer() -> impl Fn(&str) -> Vec<Token> {
     }
 }
 
-type RRVal=Result<Rc<Val>,String>;
-type RVal=Rc<Val>;
+type RRVal=Result<Arc<Val>,String>;
+type RVal=Arc<Val>;
 
 #[derive(Debug,Clone)]
 enum Val {   
@@ -75,8 +75,8 @@ enum Val {
     D(f64),
     II(Vec<i64>),
     DD(Vec<f64>),
-    S(Rc<String>),
-    SS(Vec<Rc<String>>),
+    S(Arc<String>),
+    SS(Vec<Arc<String>>),
     TBL(Dict<RVal>),
     ERR(String),
 }
@@ -98,9 +98,9 @@ impl Val {
         _ => panic!("unexpected {:?}",self)}
     }
     fn filter(&self, i: &Vec<usize>) -> RRVal { match self {
-        Val::II(j) => Ok(Val::II(i.iter().map(|v| j[*v]).collect()).into()),
-        Val::DD(j) => Ok(Val::DD(i.iter().map(|v| j[*v]).collect()).into()),
-        Val::SS(j) => Ok(Val::SS(i.iter().map(|v| j[*v].clone()).collect()).into()),
+        Val::II(j) => Ok(Val::II(i.par_iter().map(|v| j[*v]).collect()).into()),
+        Val::DD(j) => Ok(Val::DD(i.par_iter().map(|v| j[*v]).collect()).into()),
+        Val::SS(j) => Ok(Val::SS(i.par_iter().map(|v| j[*v].clone()).collect()).into()),
         _ => Err("type".into())}
     }
     fn get_vec(&self, l: usize) -> RRVal { match self {
@@ -232,23 +232,31 @@ struct Table {
 
 
 struct ECtx {
-    ctx: HashMap<String,Rc<Val>>,   // variables
-    tbl: Option<Table>,             // within select
+    ctx: HashMap<String,Arc<Val>>,   // variables
+}
+
+struct SCtx {
+    tbl: Arc<Table>,                // within select
     idx: Option<Vec<usize>>,        // idx into tbl
-    grp: Vec<String>,               // group by cols
+    grp: Arc<Vec<String>>,          // group by cols
+}
+
+impl SCtx {
+    fn new(tbl: Table) -> Self { Self { tbl:tbl.into(), idx:None, grp:(vec![]).into()}}
+    fn clone_with_idx(&self, idx:Vec<usize>) -> Self { Self { tbl:self.tbl.clone(), idx:Some(idx), grp:self.grp.clone()}}
 }
 
 impl ECtx {
-    fn new() -> Self {ECtx {ctx:HashMap::new(), tbl:None, idx: None, grp:vec![]}}
+    fn new() -> Self {ECtx {ctx:HashMap::new()}}
 
-    fn eval_table(&mut self, n: Vec<String>, e: Vec<Expr>) -> RRVal {
+    fn eval_table(&self, sctx:Option<&SCtx>, n: Vec<String>, e: Vec<Expr>) -> RRVal {
         if distinct(&n).len() != n.len() { return Err("duplicate name".into())}
-        let v = self.eval_table_inner(e)?;
+        let v = self.eval_table_inner(sctx,e)?;
         Ok(Val::TBL(Dict::from_parts(n,v)).into())
     }
 
-    fn eval_table_inner(&mut self, e: Vec<Expr>) -> Result<Vec<RVal>,String> {
-        let r = e.into_iter().map(|v| Ok(self.eval(v)?)).collect::<Result<Vec<RVal>,String>>()?;
+    fn eval_table_inner(&self, sctx:Option<&SCtx>, e: Vec<Expr>) -> Result<Vec<RVal>,String> {
+        let r = e.into_iter().map(|v| Ok(self.eval(v,sctx)?)).collect::<Result<Vec<RVal>,String>>()?;
         let mut sz = -1;
         for i in r.iter() { // all columns must be vecs of the same size, convert atoms by dup
             let rsz = i.len();
@@ -260,31 +268,37 @@ impl ECtx {
         Ok(r.into_iter().map(|v| if v.len() == -1 {v.take(sz as usize)} else {v}).collect())
     }
 
-    fn eval(&mut self, e: Expr) -> RRVal {
+    fn top_eval(&mut self, e: Expr) -> RRVal {
         match e {
-            Expr::ID(id) => self.resolve_name(&id),
-            Expr::Set(id,e) => {let v = self.eval(*e)?; self.ctx.insert(id,v.clone()); Ok(v)}
-            Expr::Val(v) => Ok(v.into()),
-            Expr::F1(f,e) => Ok(f(self.eval(*e)?)?),
-            Expr::F2(f,e1,e2) => Ok(f(self.eval(*e1)?,self.eval(*e2)?)?),
-            Expr::Tbl(n,e) => { self.eval_table(n, e) }
+            Expr::Set(id,e) => {let v = self.eval(*e, None)?; self.ctx.insert(id,v.clone()); Ok(v)},
             Expr::Sel(s) => self.do_sel(s),
+            _ => self.eval(e, None)
+        }
+    }
+
+    fn eval(&self, e: Expr, sctx:Option<&SCtx>) -> RRVal {
+        match e {
+            Expr::ID(id) => self.resolve_name(sctx,&id),
+            Expr::Val(v) => Ok(v.into()),
+            Expr::F1(f,e) => Ok(f(self.eval(*e,sctx)?)?),
+            Expr::F2(f,e1,e2) => Ok(f(self.eval(*e1,sctx)?,self.eval(*e2,sctx)?)?),
+            Expr::Tbl(n,e) => { self.eval_table(None,n,e) }
             e => Err(format!("unexpected expr {:?}",e))
         }
     }
     // search tbl, then vars
-    fn resolve_name(&self, n:&String) -> RRVal {
-        if let Some(ref tbl) = self.tbl {
-            if let Some(n2) = tbl.cmap.get(&n) {
-                let mut v = tbl.tbl.get_unchecked(&n2).clone();
-                let is_grp = self.grp.contains(&n);
-                if let Some(ref idx) = self.idx { v = if is_grp {v.idx(idx[0])?} else {v.filter(idx)?} }
+    fn resolve_name(&self, sctx:Option<&SCtx>, n:&String) -> RRVal {
+        if let Some(ctx) = sctx {
+            if let Some(n2) = ctx.tbl.cmap.get(&n) {
+                let mut v = ctx.tbl.tbl.get_unchecked(&n2).clone();
+                let is_grp = ctx.grp.contains(&n);
+                if let Some(ref idx) = ctx.idx { v = if is_grp {v.idx(idx[0])?} else {v.filter(idx)?} }
                 else {v = if is_grp {v.idx(0)?} else {v}}
                 return Ok(v)
             } else if n == "_i" {
                 // we must return idx really but we would need to clone it, it is used only in count(*) atm so it is ok
-                let mut v = tbl.tbl.v[0].clone();
-                if let Some(ref idx) = self.idx { v = v.filter(idx)? }
+                let mut v = ctx.tbl.tbl.v[0].clone();
+                if let Some(ref idx) = ctx.idx { v = v.filter(idx)? }
                 return Ok(v)
             }
         }
@@ -292,13 +306,11 @@ impl ECtx {
     }
 
     fn do_sel(&mut self, mut s:Sel) -> RRVal {
-        let (tbl,idx,grp) = (std::mem::take(&mut self.tbl),std::mem::take(&mut self.idx),std::mem::take(&mut self.grp));
         let into = std::mem::take(&mut s.into); let d = s.d;
         let r = self.do_sel_core(s);
-        self.tbl = tbl; self.idx = idx; self.grp = grp;
         let mut r = r?;
         if d { // if let will always succeed
-            if let Some(Val::TBL(ref mut d)) = Rc::get_mut(&mut r) {
+            if let Some(Val::TBL(ref mut d)) = Arc::get_mut(&mut r) {
                 let v = std::mem::take(&mut d.v);
                 d.v = Self::do_dist(v)?
             }
@@ -308,20 +320,22 @@ impl ECtx {
     }
 
     fn do_sel_core(&mut self, s:Sel) -> RRVal {
-        self.tbl = Some(self.do_join(s.j)?);
-        self.do_where(s.w)?;
+        // select context
+        let mut sctx = SCtx::new(self.do_join(s.j)?);
+        sctx.idx = self.do_where(&sctx,s.w)?;
+        // adjust the select main expr
         let se = if let Some(s) = s.s {Dict::from(s)}
             else {
-                let t = self.tbl.as_ref().unwrap();
-                let rmap: Dict<String> = Dict { k:t.cmap.v.clone(), v:t.cmap.k.clone()};
-                let k: (Vec<String>,Vec<Expr>) = t.tbl.k.iter().map(|v| {
+                let rmap: Dict<String> = Dict { k:sctx.tbl.cmap.v.clone(), v:sctx.tbl.cmap.k.clone()};
+                let k: (Vec<String>,Vec<Expr>) = sctx.tbl.tbl.k.iter().map(|v| {
                     let k = rmap.get_unchecked(v).clone();
                     (k.replace(".","_"),Expr::ID(k))}).unzip();
                 Dict::from(k)
             };
+        // group: parallel and linear
         if let Some(g) = s.g {
             let grp: Vec<String> = g.iter().filter_map(|v| if let Expr::ID(n) = v {Some(n.clone())} else {None}).collect();
-            let r = self.eval_table_inner(g)?;
+            let r = self.eval_table_inner(Some(&sctx),g)?;
             let l = r[0].len() as usize;
             let key = HashedKey::new(&r);
             let h = if l>99000 {
@@ -349,15 +363,23 @@ impl ECtx {
                 };
                 h
             };
-            let idx: Vec<Vec<usize>> = h.into_iter().map(|(_,v)| if let Some(ref i) = self.idx {v.into_iter().map(|v| i[v]).collect()} else {v}).collect();
-            self.grp = grp;
-            let r = idx.into_iter().map(|i| {self.idx = Some(i); se.v.clone().into_iter().map(|v| self.eval(v)).collect::<Result<Vec<RVal>,String>>()}).collect::<Result<Vec<Vec<RVal>>,String>>()?;
+            let idx: Vec<Vec<usize>> =
+                if let Some(ref i) = sctx.idx { h.into_par_iter().map(|(_,v)| v.into_iter().map(|v| i[v]).collect()).collect()}
+                else {h.into_iter().map(|(_,v)| v).collect()};
+            sctx.grp = grp.into();
+            let r = idx.into_par_iter()
+                .map(|i| {
+                    let sx = sctx.clone_with_idx(i);
+                    se.v.clone().into_iter()
+                        .map(|v| self.eval(v,Some(&sx)))
+                        .collect::<Result<Vec<RVal>,String>>()})
+                .collect::<Result<Vec<Vec<RVal>>,String>>()?;
             let res = r[0].iter().map(|v| v.get_vec(r[0].len())).collect::<Result<Vec<RVal>,String>>()?;
             let res = r.into_iter().try_fold(res,|res,v| res.into_iter().zip(v.into_iter())
-                .map(|(mut res,v)| {Rc::get_mut(&mut res).unwrap().join(v)?; Ok(res)}).collect::<Result<Vec<RVal>,String>>())?;
+                .map(|(mut res,v)| {Arc::get_mut(&mut res).unwrap().join(v)?; Ok(res)}).collect::<Result<Vec<RVal>,String>>())?;
             return Ok(Val::TBL(Dict::from_parts(se.k,res)).into());
         }
-        self.eval_table(se.k, se.v)
+        self.eval_table(Some(&sctx), se.k, se.v)
     }
 
     fn do_dist(v: Vec<RVal>) -> Result<Vec<RVal>,String> {
@@ -370,14 +392,14 @@ impl ECtx {
         v.into_iter().map(|v| v.filter(&idx)).collect::<Result<Vec<RVal>,String>>()
     }
 
-    fn do_where(&mut self, w:Option<Box<Expr>>) -> Result<(),String> {
+    fn do_where(&mut self, sctx:&SCtx, w:Option<Box<Expr>>) -> Result<Option<Vec<usize>>,String> {
         if let Some(e) = w {
-            return match &*self.eval(*e)? {
-                Val::II(i) => Ok(self.idx = Some(i.into_iter().enumerate().filter_map(|(i,v)| if *v == 0 {None} else {Some(i)}).collect())),
+            return match &*self.eval(*e,Some(sctx))? {
+                Val::II(i) => Ok(Some(i.into_par_iter().enumerate().filter_map(|(i,v)| if *v == 0 {None} else {Some(i)}).collect())),
                 _ => Err("where: type".into())
             }
         };
-        Ok(())
+        Ok(None)
     }
 
     fn do_join(&mut self, j:(Box<(String,Expr)>,(Vec<(String,Expr)>,Vec<(Vec<String>,Vec<String>)>))) -> Result<Table,String> {
@@ -417,7 +439,7 @@ impl ECtx {
 
     // rename columns
     fn ren(&mut self, tbl: (String,Expr), prfx: String) -> Result<Table,String> {
-        let r = self.eval(tbl.1)?;
+        let r = self.eval(tbl.1, None)?;
         let t = match &*r {
             Val::TBL(d) => d,
             _  => return Result::Err("select: not a table".into())
@@ -434,17 +456,16 @@ impl ECtx {
 
 #[derive(Clone)]
 struct HashedKey<'a> {
-    src: usize,
+    src: &'a Vec<RVal>,
     idx: usize,
-    _ph: std::marker::PhantomData<&'a usize>, // 'a ensures HK will not outlive HashMap
 }
 
 impl<'a> HashedKey<'a> {
     // 'a bounds v and the key
-    fn new(v: &'a Vec<RVal>) -> Self { Self { src: v as * const Vec<RVal> as usize, idx:0, _ph:std::marker::PhantomData}  }
-    fn clone_with_idx(&self, i: usize) -> Self { Self {src:self.src, idx:i, _ph:std::marker::PhantomData} }
+    fn new(v: &'a Vec<RVal>) -> Self { Self { src: v, idx:0}  }
+    fn clone_with_idx(&self, i: usize) -> Self { Self {src:self.src, idx:i} }
     // unsafe because the caller MUST ensure that Rcs are never cloned
-    unsafe fn get_ref(&self) -> &'a Vec<RVal> { &*(self.src as * const Vec<RVal>)}
+    unsafe fn get_ref(&self) -> &'a Vec<RVal> { self.src }
 }
 
 impl std::hash::Hash for HashedKey<'_> {
@@ -508,7 +529,7 @@ impl From<Val> for Expr {
 }
 
 type ParseFn = Box<dyn Fn(&PCtx,&[Token],usize) -> Option<(Expr,usize)>>;
-type PPFn = Box<fn(Vec<Expr>) -> Expr>;
+type PPFn = fn(Vec<Expr>) -> Expr;
 
 struct PCtx {
     rules: HashMap<String,ParseFn>,
@@ -565,9 +586,9 @@ fn parser(l: &dyn Fn(&str) -> Vec<Token>) -> PCtx {
 
     // parse helpers
     let mut pfn: HashMap<String,PPFn> = HashMap::new();
-    pfn.insert("default".to_string(),Box::new(|mut e| e.pop().unwrap())); // return the last val, in many cases it is ok
-    pfn.insert("lst".to_string(),Box::new(|e| Expr::ELst(e)));  // wrap into ELst
-    pfn.insert("sel".to_string(),Box::new(|mut e| { // select distinct? sexprs into? from join where? group?
+    pfn.insert("default".to_string(),|mut e| e.pop().unwrap()); // return the last val, in many cases it is ok
+    pfn.insert("lst".to_string(),|e| Expr::ELst(e));  // wrap into ELst
+    pfn.insert("sel".to_string(),|mut e| { // select distinct? sexprs into? from join where? group?
         let g = e.pop().unwrap().as_option().map(|v| v.as_elst());
         let w = e.pop().unwrap().as_option().map(|v| Box::new(v));
         let mut j = e.pop().unwrap().as_elst(); e.pop();
@@ -588,37 +609,37 @@ fn parser(l: &dyn Fn(&str) -> Vec<Token>) -> PCtx {
         }).unzip();
         
         Expr::Sel(Sel {s, d, into, w, g, j: (get_tbl(j.pop().unwrap().as_elst()).into(),j0)})
-    }));
-    pfn.insert("f2".to_string(),Box::new(|mut e| { // exp ('fn' exp)?
+    });
+    pfn.insert("f2".to_string(),|mut e| { // exp ('fn' exp)?
         let r = e.pop().unwrap(); let l = e.pop().unwrap();
         if let Expr::Empty = r {return l};
         let mut r = r.as_elst(); let r2 = r.pop().unwrap();
         Expr::F2(pp_fn2(r.pop().unwrap().as_id()),l.into(),r2.into())
-    }));
-    pfn.insert("2".to_string(),Box::new(|mut e| e.swap_remove(1))); // [_, e, _] -> e
-    pfn.insert("13".to_string(),Box::new(|mut e| {e.swap_remove(1); Expr::ELst(e)})); // [e, _, e] -> [e,e]
-    pfn.insert("24".to_string(),Box::new(|mut e| {e.swap_remove(2); e.remove(0); Expr::ELst(e)})); // [_, e, _, e] -> [e,e]
-    pfn.insert("conc".to_string(),Box::new(|mut e| {let mut v = e.pop().unwrap().as_elst(); e.append(&mut v); Expr::ELst(e)} )); // concat  a (b)* -> [a,b..]
-    pfn.insert("call".to_string(),Box::new(|mut e| { Expr::F1(pp_fn1(e.swap_remove(0).as_id()),e.swap_remove(2).into()) })); // fn ( exp )
-    pfn.insert("f1".to_string(),Box::new(|mut e| { let v = e.pop().unwrap(); Expr::F1(pp_fn1(e.pop().unwrap().as_id()),v.into()) })); // fn expr
-    pfn.insert("cnt".to_string(),Box::new(|_| Expr::F1(pp_fn1("count".into()),Box::new(Expr::ID("_i".into()))) )); // count(*)
-    pfn.insert("set".to_string(),Box::new(|mut e| Expr::Set(e.swap_remove(1).as_id(),e.pop().unwrap().into()) )); // set name expr
-    pfn.insert("rand".to_string(), Box::new(|mut e| { Expr::F2(pp_fn2("rand".into()),e.swap_remove(2).into(),e.swap_remove(4).into())} )); // rand(s,n)
-    pfn.insert("tblv".to_string(),Box::new(|mut e| { // [ name expr, ... ]
+    });
+    pfn.insert("2".to_string(),|mut e| e.swap_remove(1)); // [_, e, _] -> e
+    pfn.insert("13".to_string(),|mut e| {e.swap_remove(1); Expr::ELst(e)}); // [e, _, e] -> [e,e]
+    pfn.insert("24".to_string(),|mut e| {e.swap_remove(2); e.remove(0); Expr::ELst(e)}); // [_, e, _, e] -> [e,e]
+    pfn.insert("conc".to_string(),|mut e| {let mut v = e.pop().unwrap().as_elst(); e.append(&mut v); Expr::ELst(e)} ); // concat  a (b)* -> [a,b..]
+    pfn.insert("call".to_string(),|mut e| { Expr::F1(pp_fn1(e.swap_remove(0).as_id()),e.swap_remove(2).into()) }); // fn ( exp )
+    pfn.insert("f1".to_string(),|mut e| { let v = e.pop().unwrap(); Expr::F1(pp_fn1(e.pop().unwrap().as_id()),v.into()) }); // fn expr
+    pfn.insert("cnt".to_string(),|_| Expr::F1(pp_fn1("count".into()),Box::new(Expr::ID("_i".into()))) ); // count(*)
+    pfn.insert("set".to_string(),|mut e| Expr::Set(e.swap_remove(1).as_id(),e.pop().unwrap().into()) ); // set name expr
+    pfn.insert("rand".to_string(), |mut e| { Expr::F2(pp_fn2("rand".into()),e.swap_remove(2).into(),e.swap_remove(4).into())} ); // rand(s,n)
+    pfn.insert("tblv".to_string(),|mut e| { // [ name expr, ... ]
         let (e,id): (Vec<Expr>,Vec<Expr>) = e.swap_remove(1).as_elst().into_iter()
             .map(|v| {let mut v = v.as_elst(); (v.pop().unwrap(),v.pop().unwrap())}).unzip();
-        Expr::Tbl(id.into_iter().map(|v| v.as_id()).collect(),e) }));
-    pfn.insert("nexpr".to_string(),Box::new(|mut e| { // expr ('as'? ID)? -> adjust ID
+        Expr::Tbl(id.into_iter().map(|v| v.as_id()).collect(),e) });
+    pfn.insert("nexpr".to_string(),|mut e| { // expr ('as'? ID)? -> adjust ID
         let mut id = e.pop().unwrap(); let e = e.pop().unwrap(); 
         if let Expr::Empty = id { id = Expr::ID(match &e { Expr::ID(n) => n.clone(), _ => "".into()})}
         Expr::ELst(vec![e,id])
-    }));
-    pfn.insert("tbl".to_string(),Box::new(|mut e| {
+    });
+    pfn.insert("tbl".to_string(),|mut e| {
         let id = e.pop().unwrap(); let t = e.pop().unwrap().as_id();
-        Expr::ELst(vec![if let Expr::Empty = id {Expr::ID(t.clone())} else {id},Expr::ID(t)]) })); // ID ('as' ID)? -> (name,tbl)
-    pfn.insert("tsel".to_string(),Box::new(|mut e| {
+        Expr::ELst(vec![if let Expr::Empty = id {Expr::ID(t.clone())} else {id},Expr::ID(t)]) }); // ID ('as' ID)? -> (name,tbl)
+    pfn.insert("tsel".to_string(),|mut e| {
         let id = e.pop().unwrap(); e.pop();
-        Expr::ELst(vec![if let Expr::Empty = id {Expr::ID("?".into())} else {id},e.pop().unwrap()]) })); // '(' sel ')' ('as' ID)? -> (name,sel)
+        Expr::ELst(vec![if let Expr::Empty = id {Expr::ID("?".into())} else {id},e.pop().unwrap()]) }); // '(' sel ')' ('as' ID)? -> (name,sel)
     PCtx { rules:map, ppfns:pfn}
 }
 
@@ -729,18 +750,18 @@ macro_rules! fn_op2 {
                 (Val::I(i1),Val::D(i2)) => Ok(Val::D($op(*i1 as f64,*i2)).into()),
                 (Val::D(i1),Val::I(i2)) => Ok(Val::D($op(*i1,*i2 as f64)).into()),
                 (Val::D(i1),Val::D(i2)) => Ok(Val::D($op(*i1,*i2)).into()),
-                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.iter().map(|v| $op(*i1,*v)).collect()).into()),
-                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.iter().map(|v| $op(*v,*i2)).collect()).into()),
-                (Val::D(i1),Val::DD(i2)) => Ok(Val::DD(i2.iter().map(|v| $op(*i1,*v)).collect()).into()),
-                (Val::DD(i1),Val::D(i2)) => Ok(Val::DD(i1.iter().map(|v| $op(*v,*i2)).collect()).into()),
-                (Val::I(i1),Val::DD(i2)) => Ok(Val::DD(i2.iter().map(|v| $op(*i1 as f64,*v)).collect()).into()),
-                (Val::II(i1),Val::D(i2)) => Ok(Val::DD(i1.iter().map(|v| $op(*v as f64,*i2)).collect()).into()),
-                (Val::D(i1),Val::II(i2)) => Ok(Val::DD(i2.iter().map(|v| $op(*i1,*v as f64)).collect()).into()),
-                (Val::DD(i1),Val::I(i2)) => Ok(Val::DD(i1.iter().map(|v| $op(*v,*i2 as f64)).collect()).into()),
-                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
-                (Val::DD(i1),Val::DD(i2)) => Ok(Val::DD(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
-                (Val::II(i1),Val::DD(i2)) => Ok(Val::DD(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(*v1 as f64,*v2)).collect()).into()),
-                (Val::DD(i1),Val::II(i2)) => Ok(Val::DD(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(*v1,*v2 as f64)).collect()).into()),
+                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(*i1,*v)).collect()).into()),
+                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(*v,*i2)).collect()).into()),
+                (Val::D(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1,*v)).collect()).into()),
+                (Val::DD(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v,*i2)).collect()).into()),
+                (Val::I(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1 as f64,*v)).collect()).into()),
+                (Val::II(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v as f64,*i2)).collect()).into()),
+                (Val::D(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1,*v as f64)).collect()).into()),
+                (Val::DD(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v,*i2 as f64)).collect()).into()),
+                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
+                (Val::DD(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
+                (Val::II(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1 as f64,*v2)).collect()).into()),
+                (Val::DD(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2 as f64)).collect()).into()),
                 _ => Result::Err("type".into())
             }
         }
@@ -754,9 +775,9 @@ fn_op2!(fn_div2,std::ops::Div::div);
 fn fn_div(a:RVal, b:RVal) -> RRVal { 
     match (&*a,&*b) {
         (Val::I(i1),Val::I(i2)) => Ok(Val::D(*i1 as f64 / *i2 as f64).into()),
-        (Val::I(i1),Val::II(i2)) => Ok(Val::DD(i2.iter().map(|v| *i1 as f64 / *v as f64).collect()).into()),
-        (Val::II(i1),Val::I(i2)) => Ok(Val::DD(i1.iter().map(|v| *v as f64 / *i2 as f64).collect()).into()),
-        (Val::II(i1),Val::II(i2)) => Ok(Val::DD(i1.iter().zip(i2.iter()).map(|(v1,v2)| *v1 as f64 / *v2 as f64).collect()).into()),
+        (Val::I(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().map(|v| *i1 as f64 / *v as f64).collect()).into()),
+        (Val::II(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().map(|v| *v as f64 / *i2 as f64).collect()).into()),
+        (Val::II(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| *v1 as f64 / *v2 as f64).collect()).into()),
         _ => fn_div2(a,b)
     }
 }
@@ -773,22 +794,22 @@ macro_rules! fn_cop2 {
                 (Val::I(i1),Val::D(i2)) => Ok(Val::I($op(&(*i1 as f64),i2)as i64).into()),
                 (Val::D(i1),Val::I(i2)) => Ok(Val::I($op(i1,&(*i2 as f64))as i64).into()),
                 (Val::D(i1),Val::D(i2)) => Ok(Val::I($op(i1,i2)as i64).into()),
-                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::D(i1),Val::DD(i2)) => Ok(Val::II(i2.iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::DD(i1),Val::D(i2)) => Ok(Val::II(i1.iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::I(i1),Val::DD(i2)) => Ok(Val::II(i2.iter().map(|v| $op(&(*i1 as f64),v)as i64).collect()).into()),
-                (Val::II(i1),Val::D(i2)) => Ok(Val::II(i1.iter().map(|v| $op(&(*v as f64),i2)as i64).collect()).into()),
-                (Val::D(i1),Val::II(i2)) => Ok(Val::II(i2.iter().map(|v| $op(i1,&(*v as f64))as i64).collect()).into()),
-                (Val::DD(i1),Val::I(i2)) => Ok(Val::II(i1.iter().map(|v| $op(v,&(*i2 as f64))as i64).collect()).into()),
-                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
-                (Val::DD(i1),Val::DD(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
-                (Val::II(i1),Val::DD(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(&(*v1 as f64),v2)as i64).collect()).into()),
-                (Val::DD(i1),Val::II(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,&(*v2 as f64))as i64).collect()).into()),
+                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::D(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::DD(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::I(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(&(*i1 as f64),v)as i64).collect()).into()),
+                (Val::II(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(&(*v as f64),i2)as i64).collect()).into()),
+                (Val::D(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,&(*v as f64))as i64).collect()).into()),
+                (Val::DD(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,&(*i2 as f64))as i64).collect()).into()),
+                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::DD(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::II(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(&(*v1 as f64),v2)as i64).collect()).into()),
+                (Val::DD(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,&(*v2 as f64))as i64).collect()).into()),
                 (Val::S(i1),Val::S(i2)) => Ok(Val::I($op(i1,i2)as i64).into()),
-                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.iter().zip(i2.iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
                 _ => Result::Err("type".into())
             }
         }
@@ -814,7 +835,7 @@ fn fn_rand(s:RVal, num:RVal) -> RRVal {
         };
         if ty.as_ref() == "s" {
             let v = ["apple","msft","ibm","bp","gazp","google","fb","abc"];
-            let s: Vec<Rc<String>> = rng.sample_iter(rand::distributions::Uniform::from(0..v.len())).map(|i| v[i].to_string().into()).take(*n as usize).collect();
+            let s: Vec<Arc<String>> = rng.sample_iter(rand::distributions::Uniform::from(0..v.len())).map(|i| v[i].to_string().into()).take(*n as usize).collect();
             return Ok(Val::SS(s).into());
         } else if ty.as_ref() == "i" { return ri(0,100)
         } else if ty.as_ref() == "i3" { return ri(0,3)
@@ -830,9 +851,9 @@ fn fn_rand(s:RVal, num:RVal) -> RRVal {
 fn fn_sum(a:RVal) -> RRVal {
     match &*a {
         Val::I(_) => Ok(a),
-        Val::II(v) => Ok(Val::I(v.into_iter().sum()).into()),
+        Val::II(v) => Ok(Val::I(v.into_par_iter().sum()).into()),
         Val::D(_) => Ok(a),
-        Val::DD(v) => Ok(Val::D(v.into_iter().sum()).into()),
+        Val::DD(v) => Ok(Val::D(v.into_par_iter().sum()).into()),
         _ => Result::Err("type".into())
     }
 }
@@ -898,13 +919,11 @@ fn main() -> std::io::Result<()> {
     let p = parser(&l);
     let mut ectx = ECtx::new();
 
-    ectx.eval(p.parse(&l("set t [ a rand('i', 100), b rand('f',100)]"))).unwrap();
-    ectx.eval(p.parse(&l("set t2 [ a rand('i', 100), c rand('f',100)]"))).unwrap();
 
-    ectx.eval(p.parse(&l("set bt [sym rand('s',100000000), size rand('i', 100000000), price rand('f', 100000000)]"))).unwrap();
-    ectx.eval(p.parse(&l("set bt2 [sym rand('s',10000000), size rand('i', 10000000), price rand('f', 10000000)]"))).unwrap();
-    ectx.eval(p.parse(&l("set ref [sym rand('s', 100), size rand('i', 100), info rand('f',100)]"))).unwrap();
-    ectx.eval(p.parse(&l("select sym,size,max(info) as info into res from ref where size<50 group by sym,size"))).unwrap();
+    ectx.top_eval(p.parse(&l("set bt [sym rand('s',100000000), size rand('i', 100000000), price rand('f', 100000000)]"))).unwrap();
+    ectx.top_eval(p.parse(&l("set bt2 [sym rand('s',10000000), size rand('i', 10000000), price rand('f', 10000000)]"))).unwrap();
+    ectx.top_eval(p.parse(&l("set ref [sym rand('s', 100), size rand('i', 100), info rand('f',100)]"))).unwrap();
+    ectx.top_eval(p.parse(&l("select sym,size,max(info) as info into res from ref where size<50 group by sym,size"))).unwrap();
     // select sym,size,count(*),avg(price) into r from bt group by sym,size
     // select * from (select sym,size,count(*),avg(price) into r from bt where price>10.0 group by sym,size) as t1 join ref on t1.sym=ref.sym, t1.size = ref.size
     // select * from (select sym,size,count(*),avg(price) into r from bt where price>10.0 and sym='fb' group by sym,size) as t1 join ref on t1.sym=ref.sym, t1.size = ref.size
@@ -917,7 +936,7 @@ fn main() -> std::io::Result<()> {
         let s = buffer.trim();
         if s == "quit" {break} else if s.len() == 0 {continue};
         let tm = std::time::Instant::now();
-        let e = ectx.eval(p.parse(&l(s)));
+        let e = ectx.top_eval(p.parse(&l(s)));
         println!("Time: {:?}",tm.elapsed());
         match e {
             Err(e) => println!("Error: {}",e),
@@ -927,5 +946,5 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 // HashMap BTreeMap FnvHashMap
-// 10m  3.35 4.39 3.08 -> 1.9 -> 1.45 -> 1
-// 100m 44   53.4 40 -> 30 -> 17.2 -> 12
+// 10m  3.35 4.39 3.08 -> 1.9 -> 1.45 -> 1 -> 0.350
+// 100m 44   53.4 40 -> 30 -> 17.2 -> 12 -> 6
