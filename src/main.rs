@@ -395,7 +395,7 @@ impl ECtx {
     fn do_where(&mut self, sctx:&SCtx, w:Option<Box<Expr>>) -> Result<Option<Vec<usize>>,String> {
         if let Some(e) = w {
             return match &*self.eval(*e,Some(sctx))? {
-                Val::II(i) => Ok(Some(i.into_par_iter().enumerate().filter_map(|(i,v)| if *v == 0 {None} else {Some(i)}).collect())),
+                Val::II(i) => Ok(Some(i.into_par_iter().enumerate().with_min_len(5000).filter_map(|(i,v)| if *v == 0 {None} else {Some(i)}).collect())),
                 _ => Err("where: type".into())
             }
         };
@@ -750,18 +750,18 @@ macro_rules! fn_op2 {
                 (Val::I(i1),Val::D(i2)) => Ok(Val::D($op(*i1 as f64,*i2)).into()),
                 (Val::D(i1),Val::I(i2)) => Ok(Val::D($op(*i1,*i2 as f64)).into()),
                 (Val::D(i1),Val::D(i2)) => Ok(Val::D($op(*i1,*i2)).into()),
-                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(*i1,*v)).collect()).into()),
-                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(*v,*i2)).collect()).into()),
-                (Val::D(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1,*v)).collect()).into()),
-                (Val::DD(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v,*i2)).collect()).into()),
-                (Val::I(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1 as f64,*v)).collect()).into()),
-                (Val::II(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v as f64,*i2)).collect()).into()),
-                (Val::D(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().map(|v| $op(*i1,*v as f64)).collect()).into()),
-                (Val::DD(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().map(|v| $op(*v,*i2 as f64)).collect()).into()),
-                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
-                (Val::DD(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
-                (Val::II(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1 as f64,*v2)).collect()).into()),
-                (Val::DD(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2 as f64)).collect()).into()),
+                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(*i1,*v)).collect()).into()),
+                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(*v,*i2)).collect()).into()),
+                (Val::D(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().with_min_len(5000).map(|v| $op(*i1,*v)).collect()).into()),
+                (Val::DD(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).map(|v| $op(*v,*i2)).collect()).into()),
+                (Val::I(i1),Val::DD(i2)) => Ok(Val::DD(i2.par_iter().with_min_len(5000).map(|v| $op(*i1 as f64,*v)).collect()).into()),
+                (Val::II(i1),Val::D(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).map(|v| $op(*v as f64,*i2)).collect()).into()),
+                (Val::D(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().with_min_len(5000).map(|v| $op(*i1,*v as f64)).collect()).into()),
+                (Val::DD(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).map(|v| $op(*v,*i2 as f64)).collect()).into()),
+                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
+                (Val::DD(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2)).collect()).into()),
+                (Val::II(i1),Val::DD(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(*v1 as f64,*v2)).collect()).into()),
+                (Val::DD(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(*v1,*v2 as f64)).collect()).into()),
                 _ => Result::Err("type".into())
             }
         }
@@ -775,9 +775,9 @@ fn_op2!(fn_div2,std::ops::Div::div);
 fn fn_div(a:RVal, b:RVal) -> RRVal { 
     match (&*a,&*b) {
         (Val::I(i1),Val::I(i2)) => Ok(Val::D(*i1 as f64 / *i2 as f64).into()),
-        (Val::I(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().map(|v| *i1 as f64 / *v as f64).collect()).into()),
-        (Val::II(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().map(|v| *v as f64 / *i2 as f64).collect()).into()),
-        (Val::II(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| *v1 as f64 / *v2 as f64).collect()).into()),
+        (Val::I(i1),Val::II(i2)) => Ok(Val::DD(i2.par_iter().with_min_len(5000).map(|v| *i1 as f64 / *v as f64).collect()).into()),
+        (Val::II(i1),Val::I(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).map(|v| *v as f64 / *i2 as f64).collect()).into()),
+        (Val::II(i1),Val::II(i2)) => Ok(Val::DD(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| *v1 as f64 / *v2 as f64).collect()).into()),
         _ => fn_div2(a,b)
     }
 }
@@ -794,22 +794,22 @@ macro_rules! fn_cop2 {
                 (Val::I(i1),Val::D(i2)) => Ok(Val::I($op(&(*i1 as f64),i2)as i64).into()),
                 (Val::D(i1),Val::I(i2)) => Ok(Val::I($op(i1,&(*i2 as f64))as i64).into()),
                 (Val::D(i1),Val::D(i2)) => Ok(Val::I($op(i1,i2)as i64).into()),
-                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::D(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::DD(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::I(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(&(*i1 as f64),v)as i64).collect()).into()),
-                (Val::II(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(&(*v as f64),i2)as i64).collect()).into()),
-                (Val::D(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,&(*v as f64))as i64).collect()).into()),
-                (Val::DD(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,&(*i2 as f64))as i64).collect()).into()),
-                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
-                (Val::DD(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
-                (Val::II(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(&(*v1 as f64),v2)as i64).collect()).into()),
-                (Val::DD(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,&(*v2 as f64))as i64).collect()).into()),
+                (Val::I(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::II(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::D(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::DD(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::I(i1),Val::DD(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(&(*i1 as f64),v)as i64).collect()).into()),
+                (Val::II(i1),Val::D(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(&(*v as f64),i2)as i64).collect()).into()),
+                (Val::D(i1),Val::II(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(i1,&(*v as f64))as i64).collect()).into()),
+                (Val::DD(i1),Val::I(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(v,&(*i2 as f64))as i64).collect()).into()),
+                (Val::II(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::DD(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::II(i1),Val::DD(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(&(*v1 as f64),v2)as i64).collect()).into()),
+                (Val::DD(i1),Val::II(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(v1,&(*v2 as f64))as i64).collect()).into()),
                 (Val::S(i1),Val::S(i2)) => Ok(Val::I($op(i1,i2)as i64).into()),
-                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.par_iter().map(|v| $op(i1,v)as i64).collect()).into()),
-                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.par_iter().map(|v| $op(v,i2)as i64).collect()).into()),
-                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.par_iter().zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
+                (Val::S(i1),Val::SS(i2)) => Ok(Val::II(i2.par_iter().with_min_len(5000).map(|v| $op(i1,v)as i64).collect()).into()),
+                (Val::SS(i1),Val::S(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).map(|v| $op(v,i2)as i64).collect()).into()),
+                (Val::SS(i1),Val::SS(i2)) => Ok(Val::II(i1.par_iter().with_min_len(5000).zip(i2.par_iter()).map(|(v1,v2)| $op(v1,v2)as i64).collect()).into()),
                 _ => Result::Err("type".into())
             }
         }
@@ -851,18 +851,18 @@ fn fn_rand(s:RVal, num:RVal) -> RRVal {
 fn fn_sum(a:RVal) -> RRVal {
     match &*a {
         Val::I(_) => Ok(a),
-        Val::II(v) => Ok(Val::I(v.into_par_iter().sum()).into()),
+        Val::II(v) => Ok(Val::I(v.into_par_iter().with_min_len(5000).sum()).into()),
         Val::D(_) => Ok(a),
-        Val::DD(v) => Ok(Val::D(v.into_par_iter().sum()).into()),
+        Val::DD(v) => Ok(Val::D(v.into_par_iter().with_min_len(5000).sum()).into()),
         _ => Result::Err("type".into())
     }
 }
 fn fn_avg(a:RVal) -> RRVal { 
     match &*a {
         Val::I(_) => Ok(a),
-        Val::II(v) => Ok(Val::D(v.into_iter().sum::<i64>() as f64 / v.len() as f64).into()),
+        Val::II(v) => Ok(Val::D(v.into_par_iter().with_min_len(5000).sum::<i64>() as f64 / v.len() as f64).into()),
         Val::D(_) => Ok(a),
-        Val::DD(v) => Ok(Val::D(v.into_iter().sum::<f64>() / v.len() as f64).into()),
+        Val::DD(v) => Ok(Val::D(v.into_par_iter().with_min_len(5000).sum::<f64>() / v.len() as f64).into()),
         _ => Result::Err("type".into())
     }
 }
